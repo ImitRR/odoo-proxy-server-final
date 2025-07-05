@@ -1,15 +1,33 @@
 const express = require('express');
-const cors = require('cors');
+const cors = require('cors'); // Make sure cors is imported
 const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
-// Temporary: Allows all origins for debugging. Revert to specific origins for production!
-app.use(cors()); 
+
+// Explicitly configure CORS to allow your GitHub Pages origin
+// IMPORTANT: Replace 'https://imitrr.github.io' with your exact GitHub Pages URL if it changes.
+const allowedOrigins = ['https://imitrr.github.io']; 
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        // or if the origin is in our allowed list.
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) === -1) {
+            const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+            return callback(new Error(msg), false);
+        }
+        return callback(null, true);
+    },
+    credentials: true // Important for sending/receiving cookies/session info
+}));
+
 app.use(express.json());
 
-const ODOO_URL = process.env.ODOO_URL;
-const API_KEY = process.env.API_KEY;
+// These are loaded from Replit Secrets (Environment Variables)
+const ODOO_URL = process.env.ODOO_URL; // This is the base Odoo URL you configured
+const API_KEY = process.env.API_KEY;   // This is your proxy's API key
 
 // Global variable to store the Odoo session cookie.
 // IMPORTANT: For a multi-user production environment, this would need
@@ -30,121 +48,117 @@ const verifyApiKey = (req, res, next) => {
 // Login Endpoint (using /web/session/authenticate)
 app.post('/api/login', verifyApiKey, async (req, res) => {
   try {
+    // Ensure all necessary Odoo configuration details are provided in the request body
     if (!req.body.odooConfig || !req.body.odooConfig.db || 
-        !req.body.odooConfig.username || !req.body.odooConfig.password) {
-      console.error('Login error: Missing required fields in odooConfig');
-      return res.status(400).json({ error: 'Missing required fields for Odoo login' });
+        !req.body.odooConfig.username || !req.body.odooConfig.password || !req.body.odooConfig.url) {
+        console.error('Missing Odoo configuration in login request body.');
+        return res.status(400).json({ error: 'Missing Odoo configuration (url, db, username, password)' });
     }
 
-    const { db, username, password } = req.body.odooConfig;
+    const { url, db, username, password } = req.body.odooConfig; // Destructure Odoo config from request body
 
-    console.log('--- Odoo Login Request DEBUG (web/session/authenticate) ---');
-    console.log('Target Odoo URL:', `${ODOO_URL}/web/session/authenticate`);
-    // IMPORTANT: Do NOT log the password in production. For debugging only.
-    console.log('Request Payload (excluding password):', JSON.stringify({
-        jsonrpc: "2.0",
-        method: "call",
-        params: { db, login: username, password: '********' },
-        id: req.body.id || Math.floor(Math.random() * 1000)
-    }, null, 2));
-
-    const response = await axios.post(
-      `${ODOO_URL}/web/session/authenticate`,
-      {
-        jsonrpc: "2.0",
-        method: "call",
-        params: { db, login: username, password },
-        id: req.body.id || Math.floor(Math.random() * 1000)
+    const authPayload = {
+      jsonrpc: '2.0',
+      method: 'call',
+      params: {
+        db: db,
+        login: username,
+        password: password,
       },
-      {
-        headers: { "Content-Type": "application/json" },
-        timeout: 10000
-      }
-    );
+      id: 1,
+    };
 
-    console.log('--- Odoo Login Response DEBUG (web/session/authenticate) ---');
-    console.log('Odoo Response Status:', response.status);
-    console.log('Odoo Response Data:', JSON.stringify(response.data, null, 2));
+    // --- DEBUGGING LOG ---
+    console.log('--- Odoo Proxy Request DEBUG (web/session/authenticate) ---');
+    console.log('Target Odoo URL:', `${url}/web/session/authenticate`);
+    console.log('Auth Payload:', JSON.stringify(authPayload, null, 2));
+    // --- END DEBUGGING LOG ---
 
-    // Capture the Set-Cookie header from Odoo's login response
-    if (response.headers['set-cookie']) {
-      odooSessionCookie = response.headers['set-cookie'];
-      console.log('Captured Odoo Session Cookie:', odooSessionCookie);
-    } else {
-      console.warn('No Set-Cookie header found in Odoo login response.');
-    }
-
-    if (response.data && response.data.result && response.data.result.uid) {
-      return res.json({ result: response.data.result.uid });
-    }
-
-    const error = response.data && response.data.error;
-    const errorMsg = (error && error.message) || "Authentication failed";
-    console.error('Odoo login failed:', errorMsg, 'Details:', error);
-    return res.status(error.response ? error.response.status : 500).json({
-        error: "Authentication failed",
-        details: errorMsg
+    const odooResponse = await axios.post(`${url}/web/session/authenticate`, authPayload, {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      // Ensure cookies are handled for session management
+      withCredentials: true,
+      timeout: 10000 // 10 second timeout
     });
+
+    // Capture the session cookie from Odoo's response
+    const setCookieHeader = odooResponse.headers['set-cookie'];
+    if (setCookieHeader) {
+        // Extract only the cookie value (before the first ';') and join them
+        odooSessionCookie = setCookieHeader.map(cookie => cookie.split(';')[0]).join('; ');
+        console.log('Odoo Session Cookie Captured:', odooSessionCookie ? 'Yes' : 'No');
+    } else {
+        console.warn('No Odoo session cookie received in login response.');
+    }
+
+    console.log('--- Odoo Proxy Response DEBUG (web/session/authenticate) ---');
+    console.log('Odoo Response Status:', odooResponse.status);
+    console.log('Odoo Response Data:', JSON.stringify(odooResponse.data, null, 2));
+
+    if (odooResponse.data.result && odooResponse.data.result.uid) {
+      res.json({ result: odooResponse.data.result.uid }); // Return the UID on successful login
+    } else if (odooResponse.data.error) {
+      console.error('Odoo authentication error:', odooResponse.data.error);
+      return res.status(401).json({ error: odooResponse.data.error.message || 'Odoo authentication failed' });
+    } else {
+      return res.status(500).json({ error: 'Unexpected Odoo login response' });
+    }
 
   } catch (error) {
     console.error('Login endpoint error:', error.message);
     if (error.response) {
         console.error('Login endpoint Odoo Error Response Data:', JSON.stringify(error.response.data, null, 2));
-        return res.status(error.response.status).json({ error: error.response.data.error || 'Odoo login error' });
+        return res.status(error.response.status).json({ error: error.response.data.error || 'Odoo login API error' });
     } else {
-        return res.status(500).json({ error: error.message || 'Internal Server Error during login' });
+        return res.status(500).json({ error: error.message || 'Internal Server Error during Odoo login API call' });
     }
   }
 });
 
-// Odoo API Endpoint (for execute_kw calls - using /web/dataset/call_kw)
+// Generic Odoo API Endpoint (using /web/dataset/call_kw)
 app.post('/api/odoo', verifyApiKey, async (req, res) => {
     try {
-        // Frontend sends: odooConfig, model, method, args, kwargs, uid
-        const { odooConfig, model, method, args, kwargs, uid } = req.body; 
-
-        if (!ODOO_URL) {
-            console.error('ODOO_URL environment variable is not set in Glitch .env');
-            return res.status(500).json({ error: 'Server configuration error: Odoo URL not set.' });
+        if (!odooSessionCookie) {
+            console.warn('No Odoo session cookie available. Client needs to log in first.');
+            return res.status(401).json({ error: 'Unauthorized: No active Odoo session. Please log in.' });
+        }
+        // Ensure Odoo URL is provided in the request body from the client
+        if (!req.body.odooConfig || !req.body.odooConfig.url) { 
+            console.error('Missing Odoo URL in Odoo call request body.');
+            return res.status(400).json({ error: 'Missing Odoo URL in request body' });
         }
 
-        if (!uid) {
-            console.error('Odoo API call error: User ID (UID) is missing.');
-            return res.status(400).json({ error: 'User ID (UID) is required for Odoo API calls.' });
-        }
+        // Destructure Odoo API call parameters from the request body
+        const { model, method, args, kwargs } = req.body; 
+        const odooUrl = req.body.odooConfig.url; // Use odooConfig.url for the actual Odoo URL
 
-        const odooPayload = {
-            jsonrpc: "2.0",
-            method: "call",
+        const callKwPayload = {
+            jsonrpc: '2.0',
+            method: 'call',
             params: {
-                model: model, // e.g., 'product.template'
-                method: method, // e.g., 'search_read'
-                args: args, // Positional arguments (e.g., domain)
-                kwargs: kwargs, // Keyword arguments (e.g., fields, limit)
+                model: model,
+                method: method,
+                args: args,
+                kwargs: kwargs,
             },
-            id: req.body.id || Math.floor(Math.random() * 1000)
+            id: 1,
         };
 
+        // --- DEBUGGING LOG ---
         console.log('--- Odoo Proxy Request DEBUG (web/dataset/call_kw) ---');
-        console.log('Target Odoo URL:', `${ODOO_URL}/web/dataset/call_kw`);
-        console.log('Request Payload:', JSON.stringify(odooPayload, null, 2));
+        console.log('Target Odoo URL:', `${odooUrl}/web/dataset/call_kw`);
+        console.log('Call_kw Payload:', JSON.stringify(callKwPayload, null, 2));
+        console.log('Using Odoo Session Cookie:', odooSessionCookie ? 'Yes' : 'No');
+        // --- END DEBUGGING LOG ---
 
-        const odooHeaders = {
-            'Content-Type': 'application/json',
-        };
-
-        // Add the captured session cookie to the request headers
-        if (odooSessionCookie) {
-            // Note: When sending to Odoo, use the 'Cookie' header, not 'Set-Cookie'
-            odooHeaders['Cookie'] = odooSessionCookie; 
-            console.log('Sending Odoo Session Cookie with call_kw:', odooSessionCookie);
-        } else {
-            console.warn('No Odoo session cookie available for call_kw request. Session might be expired or not established.');
-            // If no session cookie, Odoo will likely return a "Session expired" error, which is fine for now.
-        }
-
-        const odooResponse = await axios.post(`${ODOO_URL}/web/dataset/call_kw`, odooPayload, {
-            headers: odooHeaders, // Use the headers object with the cookie
+        const odooResponse = await axios.post(`${odooUrl}/web/dataset/call_kw`, callKwPayload, {
+            headers: {
+                'Content-Type': 'application/json',
+                'Cookie': odooSessionCookie // Send the captured session cookie
+            },
+            withCredentials: true,
             timeout: 10000
         });
 
@@ -179,7 +193,6 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Odoo login endpoint: ${ODOO_URL}/web/session/authenticate`);
-    console.log(`Odoo API endpoint: ${ODOO_URL}/web/dataset/call_kw`);
+    console.log(`Server listening on port ${PORT}`);
+    console.log(`Access the proxy at: http://localhost:${PORT}`); // This will be Replit's internal URL
 });
